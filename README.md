@@ -656,3 +656,144 @@ We don't flip a switch. We run old and new in parallel and earn trust.
 - **No real-time streaming to Gold.** The business runs on daily reporting cycles. Streaming to Bronze is enough; Silver and Gold are batch. We can add a streaming lane later if a client demands sub-hour freshness — the architecture supports it (Pub/Sub → Dataflow streaming → BigQuery) but we don't build it speculatively.
 - **No custom schema-registry service.** Schema contracts live as JSON files in a GCS bucket, versioned. Boring. Works.
 - **No ML platform.** Not in the brief. Gold tables are ML-ready if that becomes a requirement — clean, typed, partitioned.
+
+---
+
+## 9. Project Management — Agile Delivery with Two Teams
+
+The architecture is built by two teams moving in parallel. One is dragging thousands of legacy SQL Server databases into the cloud; the other is wiring up the 50M-rows-a-day firehose. They have different rhythms, different failure modes, and different definitions of "done" — but they share a Silver layer, a Composer environment, and a release train. The project management approach has to make that sharing **explicit and scheduled**, or the two teams will discover their dependencies in production.
+
+### 9.1 Team Topology
+
+| | **Team A — Migration** | **Team B — Daily Ingestion** |
+|---|---|---|
+| **Mission** | Move historical state out of on-prem SQL Server into BigQuery Silver, without breaking the legacy analysts. | Land 50M fresh rows/day from DV360, third-party APIs, and file drops into the same Silver layer. |
+| **Work shape** | Long tail of similar units (thousands of DBs). High repetition, low novelty after the first 50. | Small number of heterogeneous connectors. Low repetition, high novelty per source. |
+| **Agile flavour** | **Kanban.** There is no natural sprint boundary in "migrate database #847 of 2,300." Continuous flow, WIP limits, cycle-time tracking. | **Scrum.** "Build the Meta Ads connector" is a sprint-sized story with a clear demo. Two-week sprints, standard ceremonies. |
+| **Owns** | Datastream config, CDC Dataflow jobs, nested-table reshaping, `dim_*` tables, cutover runbooks. | BQ Data Transfer, Cloud Functions, Pub/Sub topology, `fact_*` tables, DQ gates, freshness SLOs. |
+| **Phase mapping** | Drives Phases 1 → 4 (§7). Owns the decommission. | Drives Phases 0 → 2. Reaches steady state by Phase 3 and shifts to ops. |
+
+Both teams are fed from a **single Product Backlog** owned by one Product Owner. This is the Nexus / LeSS principle: two teams, one backlog, one Definition of Done. Splitting the backlog guarantees the teams optimise locally and drift apart.
+
+### 9.2 Where the Teams Cross Paths
+
+These are the collision points. Each one is a **scheduled ceremony or a shared artefact** — never an ad-hoc Slack thread at 11pm.
+
+```
+Sprint timeline (2-week cadence, Team B drives the clock)
+──────────────────────────────────────────────────────────────────────────────
+
+ Day 1        Day 3-4          Day 8           Day 10          Day 14
+   │             │                │               │               │
+   ▼             ▼                ▼               ▼               ▼
+┌──────┐   ┌──────────┐    ┌───────────┐   ┌───────────┐   ┌───────────┐
+│Joint │   │ Schema   │    │ Mid-sprint│   │ Integration│   │ Joint     │
+│Sprint│   │ Contract │    │ Dependency│   │ Env Merge  │   │ Review +  │
+│Plan  │   │ Review   │    │ Check     │   │ (staging)  │   │ Retro     │
+└──────┘   └──────────┘    └───────────┘   └───────────┘   └───────────┘
+   │             │                │               │               │
+   │             │                │               │               │
+Team A ─────────●────────────────●───────────────●───────────────●─────▶
+(Kanban        silver            watermark       composer        cutover
+ flow)         schema            table           DAG slot        sign-off
+
+Team B ────────●────────────────●───────────────●───────────────●─────▶
+(Scrum         silver            DQ gate         composer        demo
+ sprint)       schema            thresholds      DAG slot        fresh data
+```
+
+#### Intersection 1 — The Silver Schema Contract (continuous, formalised Day 3-4)
+
+**What it is.** The `org_silver.dim_campaign` table (§4.1.2) is written by Team A's CDC pipeline. The `org_silver.fact_impressions` table is written by Team B's DV360 pipeline. But `fact_impressions.campaign_id` is a foreign key into `dim_campaign`. If Team A renames a column or changes a datatype, Team B's dbt `relationships` test goes red.
+
+**The ceremony.** A **Schema Contract Review** on Day 3-4 of every sprint. Both teams bring their planned Silver DDL changes. Changes are merged into a versioned JSON-schema file in GCS (the "boring schema registry" from §8) *before* any code is written. A schema change without a contract PR is a blocked ticket.
+
+**Why it's early in the sprint.** Discovering a contract break on Day 12 means Team B re-plans mid-sprint. Discovering it on Day 3 means Team B plans around it from the start.
+
+#### Intersection 2 — The Watermark Table (continuous, checked Day 8)
+
+**What it is.** `org_silver._metadata_watermarks` (§4.3.1, §5.4) records how far each pipeline has loaded. Team A's CDC jobs write their LSN high-water mark here. Team B's daily DAGs write their partition-date high-water mark here. The Gold-layer dbt models read this table to decide what is safe to materialise — a Gold fact table will **not** build if the dimension it joins to has a stale watermark.
+
+**The ceremony.** A **Mid-Sprint Dependency Check** (15 minutes, async-friendly — can be a dashboard review). Both leads confirm their watermarks are advancing and there is no widening gap between dimension freshness and fact freshness. A widening gap means one team is blocked and the other hasn't noticed.
+
+**The failure mode this prevents.** Team B ships a connector that loads 50M impression rows referencing `campaign_id = 'C-9912'`. Team A hasn't migrated that client's campaign dimension yet. The join produces NULLs, the dbt test fails, the DAG halts, PagerDuty fires, and both teams lose a day arguing about whose fault it is. The dependency check catches this **before** the DAG runs.
+
+#### Intersection 3 — Composer DAG Namespace and Schedule (Day 10)
+
+**What it is.** Both teams deploy Airflow DAGs into the **same Cloud Composer environment** (§4.3.1). Team A's `sqlserver_cdc_merge` DAGs and Team B's `dv360_daily` DAGs share the scheduler, the worker pool, and — critically — the 04:00–07:00 load window before analysts arrive.
+
+**The ceremony.** An **Integration Environment Merge** on Day 10. Both teams deploy their sprint's DAG changes to a shared staging Composer. A full overnight cycle runs. DAG-name collisions, pool exhaustion, and schedule overlaps surface here, not in prod.
+
+**Why Day 10 and not Day 14.** Four days of buffer to fix what breaks. Merging on the last day of the sprint means broken staging becomes broken prod.
+
+#### Intersection 4 — Data Quality Gate Thresholds (negotiated, revisited at Retro)
+
+**What it is.** The DQ gate (§4.3.1, §5.3) halts a DAG if row counts drift >2% or null-rates spike. Team A's historical backfills legitimately produce 40M-row days followed by 200-row days — that's not an anomaly, that's a migration finishing a database. Team B's daily loads should be boringly consistent — a 40% row-count drop **is** an anomaly.
+
+**The artefact.** Per-source DQ thresholds live in a shared config file. Team A owns the `sqlserver/*` thresholds, Team B owns everything else. But the **escalation policy is joint** — a DQ halt pages one on-call rota, not two. Whoever is on-call needs enough context from both teams to triage.
+
+**The ceremony.** DQ false-positive rate is a standing agenda item in the **Joint Retro**. If Team A's backfills triggered five false alarms this sprint, that's a threshold to loosen. If Team B's connector let a bad batch through, that's a threshold to tighten.
+
+#### Intersection 5 — Client Cutover Sequencing (per client, Phase 3)
+
+**What it is.** §7 Phase 3 migrates one client per sprint. A client is "cut over" when (a) Team A has their historical dimensions in Silver *and* (b) Team B has their daily facts flowing *and* (c) the two join cleanly in Gold *and* (d) an analyst has signed off the parallel run.
+
+**The ceremony.** Cutover is a **cross-team User Story** with acceptance criteria owned by both teams. It sits at the top of the shared backlog for that sprint. Neither team can close it alone. This is the single strongest forcing function for collaboration — you cannot ship your half and walk away.
+
+**The artefact.** A **Cutover Readiness Checklist** per client, visible on the shared board:
+
+```
+Client: ACME Corp — Target cutover: Sprint 14
+─────────────────────────────────────────────────────────────
+[Team A]  Historical dims loaded          ██████████  100%
+[Team A]  CDC steady-state (7 days clean) ████████░░   80%
+[Team B]  Daily facts landing             ██████████  100%
+[Team B]  DQ gate tuned for client volume ██████░░░░   60%
+[Joint]   Gold join produces 0 orphan FKs ░░░░░░░░░░    0%  ← BLOCKED
+[Analyst] Parallel-run sign-off           ░░░░░░░░░░    —
+```
+
+#### Intersection 6 — Infrastructure-as-Code Monorepo (continuous)
+
+**What it is.** Terraform for GCS buckets, BigQuery datasets, IAM, Pub/Sub, Composer. One repo. Both teams commit to it.
+
+**The mechanism.** Not a ceremony — a **branch protection rule**. Any PR touching `terraform/shared/` (the Silver dataset, the Composer env, the Bronze bucket IAM) requires one approver from each team. GitHub CODEOWNERS enforces it. The teams cross paths in code review whether they planned to or not.
+
+### 9.3 Scrum-of-Scrums Cadence
+
+The intersections above plug into a lightweight scaling layer:
+
+| Ceremony | Cadence | Attendees | Duration | Output |
+|---|---|---|---|---|
+| Joint Sprint Planning | Day 1 of sprint | Both full teams + PO | 90 min | Sprint goal phrased as a **platform** outcome, not two team outcomes. |
+| Scrum-of-Scrums | 3×/week (Mon/Wed/Fri) | One delegate per team | 15 min | Dependency flags raised. Escalation to PO if unresolved in 24h. |
+| Schema Contract Review | Day 3-4 | Tech leads + data architect | 30 min | Approved schema diff for the sprint. |
+| Mid-Sprint Dependency Check | Day 8 | Tech leads | 15 min (async) | Watermark dashboard green, or a ticket raised. |
+| Integration Env Merge | Day 10 | Both teams (hands-on) | Half-day | Staging Composer running both teams' DAGs end-to-end. |
+| Joint Sprint Review | Day 14 | Both teams + PO + 1 analyst | 60 min | Demo runs Bronze → Gold → PowerBI using **one team's history and the other team's fresh data in the same query**. |
+| Joint Retro | Day 14 | Both full teams | 45 min | Cross-team friction surfaced. DQ false-positive rate reviewed. |
+
+Team A runs its internal Kanban standup daily and independently — the migration factory doesn't stop for Team B's sprint boundaries. Team B runs its internal Scrum standup daily. The ceremonies above are the **only** mandatory joint sessions; everything else is pull-based.
+
+### 9.4 Recommended Tooling
+
+The tool has to do three things well: (1) render a Scrum board and a Kanban board from the **same backlog**, (2) model cross-team dependencies as first-class objects, and (3) sit close to the code so a schema-contract PR and the ticket that demanded it are one click apart.
+
+| Tool | Scrum + Kanban from one backlog | Cross-team dependency links | Git / PR integration | Scaling framework support | Verdict |
+|---|---|---|---|---|---|
+| **Jira Software** (+ Advanced Roadmaps) | Native — one Project, two Boards, shared filter | Native — "is blocked by" links surface on the roadmap as red lines between team swimlanes | Deep (Bitbucket native, GitHub/GitLab via app) — ticket ↔ branch ↔ PR ↔ deploy | Advanced Roadmaps is built for exactly this: two-team capacity planning, dependency visualisation, shared releases | **Primary recommendation.** The dependency-line view is the killer feature — the PO sees intersections 1–5 as literal lines on a Gantt-style timeline. |
+| **Azure DevOps Boards** | Native — Boards per Team under one Project, shared Area Path | Native — Predecessor/Successor links, Delivery Plans for cross-team view | Deep (Azure Repos native, GitHub via extension) | Delivery Plans overlays both teams' iterations and flags dependency conflicts | **Strong alternative**, especially if the org is already on Azure AD / M365 (likely, given the PowerBI estate). Delivery Plans ≈ Advanced Roadmaps. |
+| **Linear** | Good — Projects + Cycles for Scrum, Projects without Cycles for Kanban, shared Roadmap | Adequate — "blocks / blocked by" relations, but no dedicated cross-team dependency canvas | Excellent — the GitHub sync is the tightest on the market; PR status drives ticket status automatically | Weaker — designed for single-product teams, scaling is DIY | Use if both teams are small (≤5 each) and engineering-led. The speed and Git sync outweigh the missing roadmap view at that size. |
+| **GitHub Projects** | Adequate — custom fields fake a sprint, but no native velocity/burndown | Weak — issue links exist, no dependency visualisation | Perfect — it *is* the repo | None | Fine as a **supplement** for the IaC-CODEOWNERS intersection (#6). Not enough on its own for intersections #1–#5. |
+| **Monday.com / Asana** | Good boards | Weak code integration | Shallow | Decent | Not recommended here — these are generalist PM tools. The distance from the codebase hurts when a schema PR needs to block a ticket. |
+
+**Recommendation: Jira + Advanced Roadmaps, with GitHub as the repo and Confluence for the Cutover Readiness Checklists.**
+
+Concrete setup:
+- **One Jira Project**, two Boards (`Migration — Kanban`, `Ingestion — Scrum`), one Backlog.
+- **Components** (`silver-schema`, `composer-dags`, `watermarks`, `dq-gates`, `cutover`) tag every ticket with the intersection it touches. A saved filter on each component is the agenda for that intersection's ceremony.
+- **Advanced Roadmaps Plan** spanning both teams. Dependency links are added at Joint Sprint Planning; the Plan view is the Scrum-of-Scrums dashboard.
+- **Jira ↔ GitHub app** so the schema-contract PR auto-transitions the Jira ticket and the CODEOWNERS approval is visible on the ticket timeline.
+- **Confluence page per client** holding the Cutover Readiness Checklist, embedded live from a Jira filter. The analyst signs off on the Confluence page; the sign-off macro closes the Jira epic.
+
+The tooling is deliberately boring. The value is in the six intersections being **named, scheduled, and owned** — the tool just makes them visible.
