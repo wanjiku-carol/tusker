@@ -797,3 +797,95 @@ Concrete setup:
 - **Confluence page per client** holding the Cutover Readiness Checklist, embedded live from a Jira filter. The analyst signs off on the Confluence page; the sign-off macro closes the Jira epic.
 
 The tooling is deliberately boring. The value is in the six intersections being **named, scheduled, and owned** — the tool just makes them visible.
+
+### 9.5 Metrics — What "On Track" Actually Looks Like
+
+The two teams run different Agile flavours, so their **process** metrics are different. But they build one platform, so the **outcome** metrics are shared — and those shared metrics are the ones the PO takes to the steering committee. A team can have perfect velocity and still be failing if the shared numbers aren't moving.
+
+We track three tiers: per-team flow, cross-team integration health, and platform outcome. Each tier answers a different question.
+
+```
+                 ┌─────────────────────────────────────┐
+   Tier 3        │   PLATFORM OUTCOME (shared)         │   "Is the business
+   (monthly)     │   % clients cut over, % Excel       │    better off?"
+                 │   retired, analyst hours saved      │
+                 └──────────────────▲──────────────────┘
+                                    │ only moves if Tier 2 is green
+                 ┌──────────────────┴──────────────────┐
+   Tier 2        │   INTEGRATION HEALTH (shared)       │   "Do the two halves
+   (per sprint)  │   Orphan-FK rate, contract-break    │    actually join?"
+                 │   count, joint-story completion %   │
+                 └────────▲──────────────────▲─────────┘
+                          │                  │ only moves if Tier 1 is healthy
+              ┌───────────┴──────┐  ┌────────┴───────────┐
+   Tier 1     │  TEAM A FLOW     │  │  TEAM B FLOW       │   "Is each team
+   (weekly)   │  (Kanban)        │  │  (Scrum)           │    shipping?"
+              │  Cycle time,     │  │  Velocity,         │
+              │  throughput, WIP │  │  burndown, churn   │
+              └──────────────────┘  └────────────────────┘
+```
+
+#### Tier 1 — Per-Team Flow Metrics (different per team, reviewed weekly)
+
+These measure whether each team's engine is running smoothly. They are **not** comparable across teams — comparing Kanban cycle time to Scrum velocity is meaningless. Each team owns its own Tier 1 dashboard and brings it to its own standup.
+
+**Team A — Migration (Kanban metrics)**
+
+| Metric | Definition | Target trajectory | Why it matters here |
+|---|---|---|---|
+| **Cycle time per DB** | Wall-clock from "DB picked up" → "CDC steady-state for 7 days" | ↓ sharply over first 10 sprints, then plateau | The first 50 databases are learning. After that, the process should be a factory — a rising cycle time means the easy DBs are done and the gnarly ones remain. That's a signal to re-triage the backlog, not to panic. |
+| **Throughput** | DBs reaching steady-state per week | ↑ until plateau, then flat | This is the number that feeds the decommission forecast. At 2,300 DBs, throughput of 40/week = ~14 months. The PO uses this to set stakeholder expectations. |
+| **WIP** | DBs currently between "started" and "steady-state" | Flat, at the WIP limit | If WIP creeps above the limit, DBs are starting but not finishing — usually a sign that CDC validation is bottlenecked on a shared resource (often a single person who knows the legacy schema). |
+| **Rework rate** | % of DBs that re-enter the pipeline after being marked steady-state | ↓ toward <5% | A DB bouncing back means the "7 days clean" bar was passed but something broke later. High rework = the Definition of Done is too loose. |
+| **Schema-variant count** | Distinct nested-table shapes encountered so far | ↑ fast then flatten (logarithmic) | 2,300 databases will not have 2,300 schemas — probably 30–50 variants. Once the curve flattens, every new DB is a known shape and cycle time should drop. If it keeps climbing linearly, the legacy estate is messier than scoped. |
+| **Blocked-column age** | Avg days a DB ticket sits in "Blocked" | ↓ | Migration blocks are almost always external: legacy DBA unavailable, VPN flapping, client hasn't approved the maintenance window. This metric surfaces organisational friction, not engineering friction. |
+
+**Team B — Daily Ingestion (Scrum metrics)**
+
+| Metric | Definition | Target trajectory | Why it matters here |
+|---|---|---|---|
+| **Velocity** | Story points completed per sprint | Stabilise by Sprint 4, then flat | Used for forecasting only. Never compared to Team A. Never used as a performance target (Goodhart's law applies instantly). |
+| **Sprint goal hit rate** | % of sprints where the stated goal was met | ↑ toward >80% | The goal is phrased as a platform outcome (§9.3). Missing it repeatedly means either planning is over-optimistic or Team A dependencies are landing late. |
+| **Scope churn** | % of stories added/removed after Day 1 | ↓ toward <15% | High churn often traces back to Intersection #1 — a schema change discovered mid-sprint forces re-planning. If churn stays high, the Schema Contract Review isn't working. |
+| **Escaped defect rate** | Bugs found in prod that should have been caught by the DQ gate | ↓ toward zero | Directly measures whether §5.3 controls are real. One escaped defect = one DQ threshold to tighten at the next Retro. |
+| **Connector MTTR** | Mean time from "freshness SLO breached" → "data flowing again" | ↓ | This is the Reliability priority (§5.4) expressed as a team metric. A rising MTTR on a mature connector means tribal knowledge is concentrated in one engineer. |
+| **DQ false-positive rate** | % of DQ-gate halts that were not real data problems | ↓ toward <10% | The other side of escaped defects. Too many false alarms → on-call fatigue → real alarms get ignored. Reviewed jointly at Retro (Intersection #4). |
+
+#### Tier 2 — Integration Health Metrics (shared, reviewed at Scrum-of-Scrums and Joint Review)
+
+These only exist **because there are two teams**. A single team building the whole platform would not need them. They measure the seams — intersections #1 through #6 — and they are the leading indicators for Tier 3. If Tier 2 goes red, Tier 3 will go red two sprints later.
+
+| Metric | Definition | Target | Which intersection it watches | What a bad number tells you |
+|---|---|---|---|---|
+| **Orphan-FK rate** | % of `fact_*` rows where the FK join to a `dim_*` row returns NULL | <0.1% per client before cutover | #2, #5 | Team B is landing facts for entities Team A hasn't migrated yet. Either the migration sequence is wrong or the watermark check was skipped. |
+| **Schema-contract break count** | PRs merged to Silver DDL without an approved contract-review ticket | 0 per sprint | #1 | The Day 3-4 ceremony is being bypassed. Usually happens under deadline pressure. One break is a conversation; two is a process failure. |
+| **Staging integration pass rate** | % of Day-10 staging runs where both teams' DAGs complete end-to-end first try | ↑ toward >90% | #3 | Low = teams are developing in isolation and discovering conflicts late. The Day-10 merge is too late; consider moving to Day 7. |
+| **Cross-team PR review latency** | Hours from "PR opened on `terraform/shared/`" → "approval from the other team" | <8 working hours | #6 | If this climbs, CODEOWNERS has become a bottleneck rather than a safety net. Usually means the designated reviewers are overloaded. |
+| **Joint-story completion rate** | % of cross-team cutover stories (Intersection #5) closed within their target sprint | ↑ toward >75% | #5 | The single most honest integration metric. Both teams can individually hit every Tier 1 target and still fail this — which is exactly the scenario Tier 2 exists to catch. |
+| **Dependency-caused slippage** | Story points Team B deferred because a Team A deliverable wasn't ready (and vice versa) | ↓ toward <10% of velocity | #2 | Makes the cost of poor sequencing visible in the unit each team already tracks. |
+| **Watermark gap** | Max(fact freshness) − Min(dim freshness), in hours, measured daily | <24h steady-state | #2 | A widening gap means Gold is building on stale dimensions. The dbt gate will eventually halt the build — this metric sees it coming. |
+| **Escalation count** | Issues raised at Scrum-of-Scrums that required PO intervention | ↓ over time | all | Early sprints: high is fine, the teams are learning each other's edges. Late sprints: high means the ceremonies aren't resolving friction and it's flowing uphill. |
+
+#### Tier 3 — Platform Outcome Metrics (shared, reviewed monthly with stakeholders)
+
+These are the only numbers anyone outside the two teams should ever see. They map directly to §7's migration phases and to the four priorities in §5. Tier 1 and Tier 2 are **how**; Tier 3 is **whether**.
+
+| Metric | Definition | Target | Maps to |
+|---|---|---|---|
+| **% legacy DBs in CDC steady-state** | Databases with 7+ consecutive clean days, as fraction of total estate | S-curve: slow start, steep middle, long tail | §7 Phase 1. Primarily Team A, but gated by shared Composer capacity. |
+| **% clients cut over** | Clients where the analyst has signed the parallel-run sheet and Excel is archived | Linear once Phase 3 starts: ~1 per sprint | §7 Phase 3. The headline number. Only moves when a joint story closes — **neither team can move this alone.** |
+| **% daily volume landing through the new pipeline** | Rows/day arriving via Cloud Functions + BQ Transfer + Datastream, vs. total 50M target | → 100% by end of Phase 2 | §7 Phase 2. Primarily Team B, but includes CDC volume from Team A. |
+| **Parallel-run discrepancy rate** | % of daily reconciliation checks where Excel ≠ BigQuery by more than £0.01 | → 0% for 14 consecutive days per client before cutover | §7 Phase 2, §5.3 Accuracy. The trust metric. A client does not cut over until this is zero. Both teams' correctness feeds it. |
+| **End-to-end freshness** | Age of youngest row visible in a PowerBI Gold dashboard at 08:00 | <4 hours | §5.2 Availability, §5.4 Reliability. Bronze (Team B) → Silver merge (both) → Gold dbt (shared) → PowerBI refresh. A miss can originate in either team; the metric doesn't care whose. |
+| **Analyst hours on manual ETL** | Self-reported hours/week the analytics team spends in Excel on data prep (not analysis) | ↓ toward zero | The business case. If this isn't falling, the platform is a cost centre regardless of what Tiers 1–2 say. |
+| **Unplanned downtime** | Hours/month where Gold was stale past SLO and no planned maintenance was running | <2 hrs/month | §5.2, §5.4. Jointly owned because an outage in either team's DAGs stalls Gold equally. |
+
+#### Reading the three tiers together
+
+The tiers form a diagnostic chain. Read top-down to report, bottom-up to debug:
+
+- **Tier 3 green, Tier 2 green, Tier 1 green** — steady state. Publish the Tier 3 dashboard, leave the teams alone.
+- **Tier 3 green, Tier 2 red** — trouble incoming. Integration is degrading but outcomes haven't caught up yet. Fix Tier 2 now; you have roughly two sprints before Tier 3 notices.
+- **Tier 3 red, Tier 2 green, Tier 1 green** — the teams are executing flawlessly on the wrong plan. This is a backlog-sequencing problem, not a delivery problem. The PO re-orders the backlog; the teams keep shipping.
+- **Tier 1 red on one team, Tier 2 green** — local problem, local fix. The other team does not need to slow down; the joint ceremonies absorb the slack.
+- **Tier 1 green on both, Tier 2 red** — the most dangerous pattern. Both teams feel productive, standup boards are all green, and yet the seams are splitting. This is what Tier 2 exists to catch, and it is why the Joint Review demo (§9.3) must always run **one query that joins Team A's dimensions to Team B's facts** — it is the only moment in the sprint where the seam is tested in front of everyone.
